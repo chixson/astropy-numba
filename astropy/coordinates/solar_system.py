@@ -196,8 +196,10 @@ def _get_kernel(value):
     return SPK.open(download_file(value, cache=True))
 
 
-def _get_body_barycentric_posvel(body, time, ephemeris=None, get_velocity=True):
-    """Calculate the barycentric position (and velocity) of a solar system body.
+def _get_body_barycentric_posvel_arrays(
+    body, jd1, jd2, ephemeris=None, get_velocity=True
+):
+    """Calculate barycentric position (and velocity) arrays for a solar system body.
 
     Parameters
     ----------
@@ -205,8 +207,8 @@ def _get_body_barycentric_posvel(body, time, ephemeris=None, get_velocity=True):
         The solar system body for which to calculate positions.  Can also be a
         kernel specifier (list of 2-tuples) if the ``ephemeris`` is a JPL
         kernel.
-    time : `~astropy.time.Time`
-        Time of observation.
+    jd1, jd2 : float or array-like
+        TDB Julian date split into two parts (see ERFA conventions).
     ephemeris : str, optional
         Ephemeris to use.  By default, use the one set with
         ``astropy.coordinates.solar_system_ephemeris.set``
@@ -215,14 +217,16 @@ def _get_body_barycentric_posvel(body, time, ephemeris=None, get_velocity=True):
 
     Returns
     -------
-    position : `~astropy.coordinates.CartesianRepresentation` or tuple
-        Barycentric (ICRS) position or tuple of position and velocity.
+    position : `~numpy.ndarray`
+        Barycentric (ICRS) position array, shape ``(..., 3)``.
+    velocity : `~numpy.ndarray` or None
+        Barycentric (ICRS) velocity array, shape ``(..., 3)``, if requested.
+    unit : {'au', 'km'}
+        Unit of the returned arrays. Velocity uses the corresponding per-day unit.
 
     Notes
     -----
-    Whether or not velocities are calculated makes little difference for the
-    built-in ephemerides, but for most JPL ephemeris files, the execution time
-    roughly doubles.
+    This is a low-level helper that avoids creating coordinate objects.
     """
     # If the ephemeris is to be taken from solar_system_ephemeris, or the one
     # it already contains, use the kernel there.  Otherwise, open the ephemeris,
@@ -237,7 +241,6 @@ def _get_body_barycentric_posvel(body, time, ephemeris=None, get_velocity=True):
         else:
             kernel = _get_kernel(ephemeris)
 
-        jd1, jd2 = get_jd12(time, "tdb")
         if kernel is None:
             body = body.lower()
             earth_pv_helio, earth_pv_bary = erfa.epv00(jd1, jd2)
@@ -265,16 +268,9 @@ def _get_body_barycentric_posvel(body, time, ephemeris=None, get_velocity=True):
                     body_pv_helio = erfa.plan94(jd1, jd2, body_index)
                     body_pv_bary = erfa.pvppv(body_pv_helio, sun_pv_bary)
 
-            body_pos_bary = CartesianRepresentation(
-                body_pv_bary["p"], unit=u.au, xyz_axis=-1, copy=COPY_IF_NEEDED
-            )
-            if get_velocity:
-                body_vel_bary = CartesianRepresentation(
-                    body_pv_bary["v"],
-                    unit=u.au / u.day,
-                    xyz_axis=-1,
-                    copy=COPY_IF_NEEDED,
-                )
+            body_pos_bary = body_pv_bary["p"]
+            body_vel_bary = body_pv_bary["v"] if get_velocity else None
+            unit = "au"
 
         else:
             if isinstance(body, str):
@@ -320,19 +316,67 @@ def _get_body_barycentric_posvel(body, time, ephemeris=None, get_velocity=True):
                         body_p_or_v += p_or_v
 
             body_posvel_bary.shape = body_posvel_bary.shape[:2] + jd1_shape
-            body_pos_bary = CartesianRepresentation(
-                body_posvel_bary[0], unit=u.km, copy=False
-            )
-            if get_velocity:
-                body_vel_bary = CartesianRepresentation(
-                    body_posvel_bary[1], unit=u.km / u.day, copy=False
-                )
+            body_pos_bary = body_posvel_bary[0]
+            body_vel_bary = body_posvel_bary[1] if get_velocity else None
+            unit = "km"
 
-        return (body_pos_bary, body_vel_bary) if get_velocity else body_pos_bary
+        return body_pos_bary, body_vel_bary, unit
 
     finally:
         if not default_kernel and kernel is not None:
             kernel.daf.file.close()
+
+
+def _get_body_barycentric_posvel(body, time, ephemeris=None, get_velocity=True):
+    """Calculate the barycentric position (and velocity) of a solar system body.
+
+    Parameters
+    ----------
+    body : str or other
+        The solar system body for which to calculate positions.  Can also be a
+        kernel specifier (list of 2-tuples) if the ``ephemeris`` is a JPL
+        kernel.
+    time : `~astropy.time.Time`
+        Time of observation.
+    ephemeris : str, optional
+        Ephemeris to use.  By default, use the one set with
+        ``astropy.coordinates.solar_system_ephemeris.set``
+    get_velocity : bool, optional
+        Whether or not to calculate the velocity as well as the position.
+
+    Returns
+    -------
+    position : `~astropy.coordinates.CartesianRepresentation` or tuple
+        Barycentric (ICRS) position or tuple of position and velocity.
+
+    Notes
+    -----
+    Whether or not velocities are calculated makes little difference for the
+    built-in ephemerides, but for most JPL ephemeris files, the execution time
+    roughly doubles.
+    """
+    jd1, jd2 = get_jd12(time, "tdb")
+    body_pos_bary, body_vel_bary, unit = _get_body_barycentric_posvel_arrays(
+        body, jd1, jd2, ephemeris=ephemeris, get_velocity=get_velocity
+    )
+    if unit == "au":
+        pos_unit = u.au
+        vel_unit = u.au / u.day
+        copy = COPY_IF_NEEDED
+    else:
+        pos_unit = u.km
+        vel_unit = u.km / u.day
+        copy = False
+
+    body_pos_bary = CartesianRepresentation(
+        body_pos_bary, unit=pos_unit, xyz_axis=-1, copy=copy
+    )
+    if get_velocity:
+        body_vel_bary = CartesianRepresentation(
+            body_vel_bary, unit=vel_unit, xyz_axis=-1, copy=copy
+        )
+
+    return (body_pos_bary, body_vel_bary) if get_velocity else body_pos_bary
 
 
 def get_body_barycentric_posvel(body, time, ephemeris=None):
